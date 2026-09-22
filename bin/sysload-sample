@@ -1,0 +1,299 @@
+#!/bin/bash
+#
+# One JSON line of raw system counters for the blacksheep.sysload bar widget.
+#
+# Everything here is a counter or an instantaneous reading; no rates are
+# computed. The widget keeps the previous sample and does the delta maths, so
+# this script stays stateless and a dropped sample costs one tick rather than a
+# wrong number.
+#
+# The one exception is per-process CPU, which genuinely needs state: `ps %cpu`
+# reports an average over the process's whole lifetime, which is the wrong
+# question when you are asking "what is hammering this machine right now". So
+# the process pass caches its own tick counters under $XDG_RUNTIME_DIR and
+# reports the delta.
+#
+# Usage: sysload-sample [--procs]
+#   --procs  also walk /proc/<pid>/stat for the top CPU and memory consumers.
+#            Costs ~500 small reads, so the widget asks for it only while the
+#            panel is open.
+
+set -o pipefail
+
+WITH_PROCS=0
+[[ $1 == --procs ]] && WITH_PROCS=1
+
+CACHE="${XDG_RUNTIME_DIR:-/tmp}/sysload-proc.cache"
+
+# ---------------------------------------------------------------- sensors
+#
+# hwmon numbering is discovered at boot and is not stable across reboots, so
+# resolve by driver name every run rather than hardcoding hwmon3. Within
+# coretemp, prefer the "Package id 0" sensor over a single core: the package
+# reading is what the thermal governor actually throttles against.
+find_coretemp() {
+  local dir label
+  for dir in /sys/class/hwmon/hwmon*; do
+    [[ $(cat "$dir/name" 2>/dev/null) == coretemp ]] || continue
+    for label in "$dir"/temp*_label; do
+      [[ -r $label ]] || continue
+      if [[ $(cat "$label" 2>/dev/null) == "Package id 0" ]]; then
+        echo "${label%_label}"
+        return 0
+      fi
+    done
+    # No package sensor (AMD k10temp-style layout): temp1 is the die.
+    [[ -r $dir/temp1_input ]] && { echo "$dir/temp1"; return 0; }
+  done
+  # Last resort: whatever acpitz thinks the board is doing.
+  for dir in /sys/class/hwmon/hwmon*; do
+    if [[ $(cat "$dir/name" 2>/dev/null) == acpitz && -r $dir/temp1_input ]]; then
+      echo "$dir/temp1"
+      return 0
+    fi
+  done
+  return 1
+}
+
+find_nvmetemp() {
+  local dir
+  for dir in /sys/class/hwmon/hwmon*; do
+    if [[ $(cat "$dir/name" 2>/dev/null) == nvme && -r $dir/temp1_input ]]; then
+      echo "$dir/temp1_input"
+      return 0
+    fi
+  done
+  return 1
+}
+
+read_num() { local v; read -r v <"$1" 2>/dev/null && echo "$v" || echo ""; }
+
+CPU_TEMP_BASE=$(find_coretemp)
+NVME_TEMP_FILE=$(find_nvmetemp)
+
+temp_cpu=""; temp_cpu_max=""; temp_nvme=""
+if [[ -n $CPU_TEMP_BASE ]]; then
+  temp_cpu=$(read_num "${CPU_TEMP_BASE}_input")
+  # temp*_max is the throttle point, temp*_crit the shutdown point. Headroom
+  # should be measured against the temperature the CPU starts backing off at,
+  # not the one where the machine dies, so prefer _max and only fall back.
+  temp_cpu_max=$(read_num "${CPU_TEMP_BASE}_max")
+  [[ -z $temp_cpu_max ]] && temp_cpu_max=$(read_num "${CPU_TEMP_BASE}_crit")
+fi
+[[ -n $NVME_TEMP_FILE ]] && temp_nvme=$(read_num "$NVME_TEMP_FILE")
+
+# The pid list is a glob rather than a `ls` so the whole script stays at one
+# fork; awk re-checks each pid when it opens the file anyway.
+if ((WITH_PROCS)); then
+  pids=(/proc/[0-9]*)
+  pids=("${pids[@]##*/}")
+  export SYSLOAD_PIDS="${pids[*]}"
+fi
+
+# ---------------------------------------------------------------- one awk pass
+#
+# /proc reads are cheap individually but a fork per file is not, so everything
+# that is a plain file read happens inside a single awk invocation.
+awk \
+  -v with_procs="$WITH_PROCS" \
+  -v cache="$CACHE" \
+  -v temp_cpu="$temp_cpu" \
+  -v temp_cpu_max="$temp_cpu_max" \
+  -v temp_nvme="$temp_nvme" \
+  '
+function jnum(v) { return (v == "" || v + 0 != v) ? "null" : v + 0 }
+function jstr(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return "\"" s "\"" }
+
+# ---- aggregate CPU ticks; the per-core lines give us a core count for free
+FILENAME == "/proc/stat" {
+  if ($1 == "cpu") {
+    cpu_total = 0
+    for (i = 2; i <= NF; i++) cpu_total += $i
+    # idle + iowait: a CPU waiting on the disk is not doing work, and counting
+    # iowait as busy makes a disk-bound machine look compute-bound.
+    cpu_idle = $5 + $6
+  } else if ($1 ~ /^cpu[0-9]+$/) {
+    cores++
+  } else if ($1 == "procs_running") {
+    procs_running = $2
+  } else if ($1 == "procs_blocked") {
+    procs_blocked = $2
+  }
+  next
+}
+
+FILENAME == "/proc/meminfo" {
+  key = $1; sub(/:$/, "", key)
+  mem[key] = $2
+  next
+}
+
+FILENAME == "/proc/loadavg" { load1 = $1; load5 = $2; load15 = $3; next }
+FILENAME == "/proc/uptime"  { uptime = $1; next }
+
+# ---- PSI. "some" is any task stalled, "full" is every task stalled. For the
+# headline we care about full (real, total loss of forward progress) but keep
+# some, because on memory it is the earlier warning.
+FILENAME ~ /^\/proc\/pressure\// {
+  resource = FILENAME; sub(/.*\//, "", resource)
+  for (i = 2; i <= NF; i++) {
+    split($i, kv, "=")
+    if (kv[1] == "avg10") psi[resource "_" $1] = kv[2]
+  }
+  next
+}
+
+# ---- network: every interface except loopback and virtual bridges, which
+# would otherwise double-count container traffic against itself.
+FILENAME == "/proc/net/dev" {
+  if ($1 !~ /:$/ && $0 !~ /:/) next
+  iface = $1; sub(/:.*/, "", iface)
+  if (iface == "lo" || iface ~ /^(docker|veth|br-|virbr)/) next
+  # The colon may or may not be glued to the byte count depending on width.
+  line = $0
+  sub(/^[^:]*:/, " ", line)
+  n = split(line, f, " ")
+  if (n >= 9) { net_rx += f[1]; net_tx += f[9] }
+  next
+}
+
+# ---- disk: whole block devices only. Partitions and dm-* mappings restate
+# the same I/O their parent already reported.
+FILENAME == "/proc/diskstats" {
+  dev = $3
+  if (dev !~ /^(nvme[0-9]+n[0-9]+|sd[a-z]+|vd[a-z]+|mmcblk[0-9]+)$/) next
+  # Fields 6 and 10 are sectors read / written, always 512 bytes here
+  # regardless of the device'"'"'s physical block size.
+  disk_read  += $6
+  disk_write += $10
+  next
+}
+
+# ---- per-process, only with --procs.
+#
+# Read from inside awk rather than passing /proc/<pid>/stat on the command
+# line: processes exit between the glob and the open, and a named input file
+# that has gone away is fatal to gawk, which would cost us the whole sample.
+# getline just returns -1.
+function scan_procs(   pids, n, i, pid, path, line, open_paren, close_paren, rest, f, nf) {
+  n = split(ENVIRON["SYSLOAD_PIDS"], pids, " ")
+  for (i = 1; i <= n; i++) {
+    pid = pids[i]
+    path = "/proc/" pid "/stat"
+    if ((getline line < path) <= 0) { close(path); continue }
+    close(path)
+
+    # comm is parenthesised and may itself contain spaces and parens, so split
+    # on the LAST close paren rather than tokenising from the left.
+    open_paren = index(line, "(")
+    close_paren = 0
+    for (j = length(line); j > 0; j--) {
+      if (substr(line, j, 1) == ")") { close_paren = j; break }
+    }
+    if (open_paren == 0 || close_paren == 0) continue
+
+    # Fields after the close paren start at field 3 (state), so overall field N
+    # sits at index N-2 here: utime=14, stime=15, rss=24.
+    rest = substr(line, close_paren + 2)
+    nf = split(rest, f, " ")
+    if (nf < 22) continue
+
+    proc_name[pid] = substr(line, open_paren + 1, close_paren - open_paren - 1)
+    proc_ticks[pid] = f[12] + f[13]
+    proc_rss[pid] = f[22] * 4096
+  }
+}
+
+END {
+  if (with_procs) scan_procs()
+
+  # ---- per-process CPU needs two samples; the cache holds the previous one.
+  if (with_procs) {
+    prev_uptime = ""
+    while ((getline cline < cache) > 0) {
+      split(cline, c, " ")
+      if (c[1] == "#") prev_uptime = c[2]
+      else prev[c[1]] = c[2]
+    }
+    close(cache)
+
+    elapsed = (prev_uptime == "") ? 0 : uptime - prev_uptime
+    # A stale cache (suspend, or the panel reopened an hour later) would divide
+    # a huge tick delta by a huge elapsed and land somewhere meaningless, so
+    # only trust a window that looks like a live poll interval.
+    usable = (elapsed > 0.2 && elapsed < 30)
+
+    printf "" > cache
+    printf "# %s\n", uptime > cache
+    for (pid in proc_ticks) {
+      printf "%s %s\n", pid, proc_ticks[pid] > cache
+      if (usable && (pid in prev)) {
+        d = proc_ticks[pid] - prev[pid]
+        # Negative means the pid was recycled onto a different process.
+        if (d >= 0) proc_cpu[pid] = (d / 100.0) / elapsed * 100.0
+      }
+    }
+    close(cache)
+  }
+
+  mem_total = mem["MemTotal"]
+  printf "{"
+  printf "\"uptime\":%s", jnum(uptime)
+  printf ",\"cores\":%s", jnum(cores)
+  printf ",\"cpu\":{\"total\":%s,\"idle\":%s}", jnum(cpu_total), jnum(cpu_idle)
+  printf ",\"procs\":{\"running\":%s,\"blocked\":%s}", jnum(procs_running), jnum(procs_blocked)
+  printf ",\"mem\":{\"total\":%s,\"available\":%s,\"free\":%s,\"cached\":%s,\"buffers\":%s,\"swapTotal\":%s,\"swapFree\":%s,\"dirty\":%s}", \
+    jnum(mem_total), jnum(mem["MemAvailable"]), jnum(mem["MemFree"]), jnum(mem["Cached"]), \
+    jnum(mem["Buffers"]), jnum(mem["SwapTotal"]), jnum(mem["SwapFree"]), jnum(mem["Dirty"])
+  printf ",\"psi\":{\"cpuSome\":%s,\"memSome\":%s,\"memFull\":%s,\"ioSome\":%s,\"ioFull\":%s}", \
+    jnum(psi["cpu_some"]), jnum(psi["memory_some"]), jnum(psi["memory_full"]), \
+    jnum(psi["io_some"]), jnum(psi["io_full"])
+  printf ",\"load\":[%s,%s,%s]", jnum(load1), jnum(load5), jnum(load15)
+  printf ",\"net\":{\"rx\":%s,\"tx\":%s}", jnum(net_rx), jnum(net_tx)
+  printf ",\"disk\":{\"read\":%s,\"write\":%s}", jnum(disk_read * 512), jnum(disk_write * 512)
+  printf ",\"temp\":{\"cpu\":%s,\"cpuMax\":%s,\"nvme\":%s}", \
+    (temp_cpu == "" ? "null" : temp_cpu / 1000.0), \
+    (temp_cpu_max == "" ? "null" : temp_cpu_max / 1000.0), \
+    (temp_nvme == "" ? "null" : temp_nvme / 1000.0)
+
+  if (with_procs) {
+    printf ",\"top\":["
+    first = 1
+    # Small n (a handful of winners out of ~500), so repeated max-scans beat
+    # pulling in a sort.
+    for (round = 0; round < 5; round++) {
+      best = ""; bestv = -1
+      for (pid in proc_cpu) {
+        if (!(pid in taken_cpu) && proc_cpu[pid] > bestv) { bestv = proc_cpu[pid]; best = pid }
+      }
+      if (best == "" || bestv <= 0.05) break
+      taken_cpu[best] = 1
+      printf "%s{\"pid\":%s,\"name\":%s,\"cpu\":%.1f,\"rss\":%s}", \
+        (first ? "" : ","), best, jstr(proc_name[best]), bestv, jnum(proc_rss[best])
+      first = 0
+    }
+    printf "]"
+
+    printf ",\"topMem\":["
+    first = 1
+    for (round = 0; round < 5; round++) {
+      best = ""; bestv = -1
+      for (pid in proc_rss) {
+        if (!(pid in taken_mem) && proc_rss[pid] > bestv) { bestv = proc_rss[pid]; best = pid }
+      }
+      if (best == "" || bestv <= 0) break
+      taken_mem[best] = 1
+      printf "%s{\"pid\":%s,\"name\":%s,\"rss\":%s,\"cpu\":%.1f}", \
+        (first ? "" : ","), best, jstr(proc_name[best]), bestv, \
+        ((best in proc_cpu) ? proc_cpu[best] : 0)
+      first = 0
+    }
+    printf "]"
+  }
+
+  printf "}\n"
+}
+  ' \
+  /proc/stat /proc/meminfo /proc/loadavg /proc/uptime \
+  /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io \
+  /proc/net/dev /proc/diskstats 2>/dev/null
