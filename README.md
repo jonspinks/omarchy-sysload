@@ -3,6 +3,8 @@
 One dial in the bar for how hard the machine is working. Hover it for the
 summary, click it for the numbers, right-click it for btop.
 
+![The System Load panel](preview.png)
+
 ## Install
 
 ```bash
@@ -11,6 +13,17 @@ omarchy plugin add https://github.com/jonspinks/omarchy-sysload --enable
 
 `--enable` places it in the bar; `omarchy plugin enable blacksheep.sysload --before omarchy.network`
 puts it somewhere specific, and you can always drag it along the bar afterwards.
+
+## Remove
+
+```bash
+omarchy plugin remove blacksheep.sysload
+```
+
+That takes it off the bar and deletes the plugin folder. The only other thing
+it leaves behind is its per-process CPU cache, `$XDG_RUNTIME_DIR/sysload-proc.cache`,
+which goes away at logout (or `~/.cache/sysload/` on a session without a runtime
+directory, which is safe to delete).
 
 ## What the dial actually means
 
@@ -95,6 +108,15 @@ of desktop boards register an `acpi_fan` that never reports RPM.
 A Linux kernel with PSI enabled (`CONFIG_PSI=y`, the default on Arch). Without
 it the memory and I/O sub-scores fall back to 0 and the dial runs on CPU,
 memory headroom and temperature alone.
+
+Temperature comes from Intel `coretemp` (the package sensor) or AMD
+`k10temp`/`zenpower` (`Tctl`), with the ACPI thermal zone as a last resort.
+AMD doesn't report a throttle point, so on AMD the Heat row shows the
+temperature but doesn't feed the dial.
+
+Everything it runs ships with Omarchy: `bash`, `awk`, and `btop` behind
+right-click via `omarchy-launch-or-focus-tui`. It reads only `/proc` and
+`/sys`, makes no network requests, and needs no privileges.
 
 ## License
 

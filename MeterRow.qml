@@ -70,7 +70,9 @@ Item {
     id: valueLabel
     anchors.right: parent.right
     anchors.verticalCenter: labelText.verticalCenter
-    width: Style.space(62)
+    // Grows to fit "11.2 GB / 31.3 GB" rather than eliding it; the fixed floor
+    // keeps short values in a column, the cap keeps room for the bar.
+    width: Math.max(Style.space(62), Math.min(implicitWidth, root.width * 0.45))
     horizontalAlignment: Text.AlignRight
     text: root.valueText
     textFormat: Text.PlainText

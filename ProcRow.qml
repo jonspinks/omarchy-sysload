@@ -32,10 +32,11 @@ Item {
 
     Text {
       anchors.left: parent.left
-      anchors.leftMargin: Math.min(parent.contentWidth + Style.space(6),
-                                   parent.width - implicitWidth)
+      anchors.leftMargin: parent.contentWidth + Style.space(6)
       anchors.baseline: parent.baseline
-      visible: root.procPid > 0 && parent.contentWidth < parent.width - implicitWidth
+      // Only when the gap fits too; otherwise a long name runs into its pid.
+      visible: root.procPid > 0
+        && parent.contentWidth + Style.space(6) + implicitWidth <= parent.width
       text: root.procPid
       textFormat: Text.PlainText
       color: root.foreground
@@ -49,7 +50,8 @@ Item {
     id: amountText
     anchors.right: parent.right
     anchors.verticalCenter: nameText.verticalCenter
-    width: Style.space(104)
+    // Fits "594 MB  ·  1% cpu" whole; the name to the left elides instead.
+    width: Math.max(Style.space(104), Math.min(implicitWidth, root.width * 0.5))
     horizontalAlignment: Text.AlignRight
     text: root.amountNote !== "" ? root.amount + "  ·  " + root.amountNote : root.amount
     textFormat: Text.PlainText

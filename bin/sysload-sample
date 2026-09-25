@@ -10,7 +10,8 @@
 # The one exception is per-process CPU, which genuinely needs state: `ps %cpu`
 # reports an average over the process's whole lifetime, which is the wrong
 # question when you are asking "what is hammering this machine right now". So
-# the process pass caches its own tick counters under $XDG_RUNTIME_DIR and
+# the process pass caches its own tick counters under $XDG_RUNTIME_DIR (or a
+# private cache directory) and
 # reports the delta.
 #
 # Usage: sysload-sample [--procs]
@@ -23,7 +24,16 @@ set -o pipefail
 WITH_PROCS=0
 [[ $1 == --procs ]] && WITH_PROCS=1
 
-CACHE="${XDG_RUNTIME_DIR:-/tmp}/sysload-proc.cache"
+# Never /tmp: awk's `> cache` follows symlinks, so a world-writable directory
+# would let another user point the cache at one of our files. The runtime dir
+# is private to us; without one, fall back to a 0700 directory in our cache.
+if [[ -n $XDG_RUNTIME_DIR && -d $XDG_RUNTIME_DIR && -O $XDG_RUNTIME_DIR ]]; then
+  CACHE="$XDG_RUNTIME_DIR/sysload-proc.cache"
+else
+  cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/sysload"
+  mkdir -p -m 0700 -- "$cache_dir" 2>/dev/null
+  CACHE="$cache_dir/proc.cache"
+fi
 
 # ---------------------------------------------------------------- sensors
 #
@@ -32,18 +42,33 @@ CACHE="${XDG_RUNTIME_DIR:-/tmp}/sysload-proc.cache"
 # coretemp, prefer the "Package id 0" sensor over a single core: the package
 # reading is what the thermal governor actually throttles against.
 find_coretemp() {
-  local dir label
+  local dir label name
   for dir in /sys/class/hwmon/hwmon*; do
-    [[ $(cat "$dir/name" 2>/dev/null) == coretemp ]] || continue
-    for label in "$dir"/temp*_label; do
-      [[ -r $label ]] || continue
-      if [[ $(cat "$label" 2>/dev/null) == "Package id 0" ]]; then
-        echo "${label%_label}"
-        return 0
-      fi
-    done
-    # No package sensor (AMD k10temp-style layout): temp1 is the die.
-    [[ -r $dir/temp1_input ]] && { echo "$dir/temp1"; return 0; }
+    name=$(cat "$dir/name" 2>/dev/null)
+    case $name in
+      coretemp)
+        # Intel: the package sensor, not one core.
+        for label in "$dir"/temp*_label; do
+          [[ -r $label ]] || continue
+          if [[ $(cat "$label" 2>/dev/null) == "Package id 0" ]]; then
+            echo "${label%_label}"
+            return 0
+          fi
+        done
+        [[ -r $dir/temp1_input ]] && { echo "$dir/temp1"; return 0; }
+        ;;
+      k10temp | zenpower)
+        # AMD: Tctl is the control temperature the firmware throttles on;
+        # Tdie on older parts. Otherwise temp1 is the die.
+        for label in "$dir"/temp*_label; do
+          [[ -r $label ]] || continue
+          case $(cat "$label" 2>/dev/null) in
+            Tctl | Tdie) echo "${label%_label}"; return 0 ;;
+          esac
+        done
+        [[ -r $dir/temp1_input ]] && { echo "$dir/temp1"; return 0; }
+        ;;
+    esac
   done
   # Last resort: whatever acpitz thinks the board is doing.
   for dir in /sys/class/hwmon/hwmon*; do
